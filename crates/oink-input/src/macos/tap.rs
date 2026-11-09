@@ -1,6 +1,6 @@
 //! 截获：专用线程上的 active session event tap。
 //!
-//! 回调里只做：识别并放过自己注入的事件、翻译、调用处理函数、决定吞掉与否。所有发给 WindowServer 的
+//! 回调里只做：识别并放过自己及外部注入的事件、翻译物理输入、调用处理函数、决定吞掉与否。所有发给 WindowServer 的
 //! 同步调用（warp、解耦、隐藏光标）都推迟到回调返回之后，由本线程的循环执行（见 `Pending`）。
 //! 循环每 250 ms 醒来一次：执行推迟的光标操作；每 5 s 检查 tap 是否仍启用。
 //! 锁屏或安全输入不代表物理键已松开；抬键清理统一使用下面的 HID 核对。
@@ -112,6 +112,8 @@ pub(crate) struct Shared {
     motion: Arc<super::cursor_reveal::Motion>,
     motion_generation: u64,
     remote: AtomicBool,
+    /// External pointer input uses this Mac without changing the shared focus.
+    external_pointer: AtomicBool,
     keyboard_remote: AtomicBool,
     /// Remote 模式下隐藏的光标：冻结在哪里（只在截获线程的循环里、持有 `cursor_lock` 时修改）。
     hidden: Mutex<HiddenCursor>,
@@ -297,6 +299,7 @@ impl Tap {
             handler,
             gestures: Mutex::new(super::gesture_diagnostics::Tracker::default()),
             remote: AtomicBool::new(false),
+            external_pointer: AtomicBool::new(false),
             keyboard_remote: AtomicBool::new(false),
             hidden: Mutex::new(HiddenCursor::Shown),
             owner_generation: AtomicU64::new(0),
@@ -406,6 +409,7 @@ impl Tap {
             }
         };
         if changed {
+            s.external_pointer.store(false, Ordering::Release);
             s.motion.reset_position_context();
         }
         self.schedule_apply();
@@ -604,6 +608,7 @@ impl Tap {
         s.restore_pending.store(true, Ordering::Release);
         // 先挡住移动事件，再离开 Remote（见 `apply_mode`）：warp 做完之前送到的事件一律吞掉。
         s.hold_motion.store(true, Ordering::Release);
+        s.external_pointer.store(false, Ordering::Release);
         s.remote.store(false, Ordering::Release);
         self.schedule_apply();
     }
@@ -688,13 +693,14 @@ fn apply_mode_locked(s: &'static Shared, hidden: &mut HiddenCursor) {
         // After withdrawal, posted moves may never be acknowledged. Do not wait,
         // warp, or replay a pending owner move: return local cursor ownership once.
         s.remote.store(false, Ordering::Release);
+        s.external_pointer.store(false, Ordering::Release);
         s.keyboard_remote.store(false, Ordering::Release);
         s.hold_motion.store(false, Ordering::Release);
         s.restore_pending.store(false, Ordering::Release);
         s.owner_generation.store(0, Ordering::Release);
         s.owner_posts.lock().unwrap_or_else(|e| e.into_inner()).count = 0;
         *hidden = HiddenCursor::Shown;
-        cursor::source_disabled(false);
+        cursor::source_disabled(false, false);
         cursor::restore();
         return;
     }
@@ -707,10 +713,11 @@ fn apply_mode_locked(s: &'static Shared, hidden: &mut HiddenCursor) {
         return;
     }
     let posts = s.owner_posts_snapshot();
-    if (!s.remote.load(Ordering::Acquire) || stop) && posts.count != 0 {
+    if (!s.cursor_remote() || stop) && posts.count != 0 {
         // CGEventPost changes the global pointer before even an active HID tap can reject it.
-        // Keep the owner alive until our already-posted events reach the session tap, then warp.
-        // A disabled tap can lose acknowledgements; never leave Local or stop waiting forever.
+        // Drain already-posted events before releasing the blank owner. Local
+        // restoration also warps; external input retains its delivered position.
+        // A disabled tap can lose acknowledgements; never wait forever.
         if now_event_ns().saturating_sub(posts.started_ns) < 250_000_000 {
             if let Some(token) = handoff_timing::scope() {
                 let mut event = handoff_timing::Event::new(TimingStage::NativeDeferred, token);
@@ -719,20 +726,31 @@ fn apply_mode_locked(s: &'static Shared, hidden: &mut HiddenCursor) {
                 event.count = u64::from(posts.count);
                 handoff_timing::emit(event);
             }
-            s.hold_motion.store(true, Ordering::Release);
+            if !s.remote.load(Ordering::Acquire) {
+                s.hold_motion.store(true, Ordering::Release);
+            }
             tracing::debug!(
                 pending = posts.count,
-                "cursor owner: waiting for posted moves before Local warp"
+                "cursor owner: waiting for posted moves before reveal"
             );
             return;
         }
         s.owner_posts.lock().unwrap_or_else(|e| e.into_inner()).count = 0;
         tracing::warn!(
             pending = posts.count,
-            "cursor owner: event acknowledgement timeout; restoring Local"
+            "cursor owner: event acknowledgement timeout; revealing cursor"
         );
     }
-    if s.remote.load(Ordering::Acquire) && !stop {
+    if s.remote.load(Ordering::Acquire) && s.external_pointer.load(Ordering::Acquire) && !stop {
+        s.owner_generation.store(0, Ordering::Release);
+        *hidden = HiddenCursor::Shown;
+        cursor::restore_external();
+        s.hold_motion.store(false, Ordering::Release);
+    } else if s.remote.load(Ordering::Acquire) && !stop {
+        if s.owner_generation.load(Ordering::Acquire) == 0 {
+            s.owner_generation
+                .store(cursor::owner::next_generation(), Ordering::Release);
+        }
         if *hidden == HiddenCursor::Shown {
             s.warp_fix.lock().unwrap_or_else(|e| e.into_inner()).enter_remote();
             let at = freeze_clear_of_zones(s);
@@ -768,7 +786,7 @@ fn apply_mode_locked(s: &'static Shared, hidden: &mut HiddenCursor) {
         s.owner_generation.store(0, Ordering::Release);
         *hidden = HiddenCursor::Shown;
         if stop {
-            cursor::source_disabled(false);
+            cursor::source_disabled(false, false);
         }
         cursor::restore();
         s.hold_motion.store(false, Ordering::Release);
@@ -871,10 +889,14 @@ impl Shared {
         let epoch = self.timing_epoch.load(Ordering::Relaxed);
         (epoch != 0).then_some(TimingToken { epoch, sequence: 0 })
     }
+    fn cursor_remote(&self) -> bool {
+        self.remote.load(Ordering::Acquire) && !self.external_pointer.load(Ordering::Acquire)
+    }
+
     fn owner_current(&self, generation: u64) -> bool {
         generation != 0
             && self.capture_permitted()
-            && self.remote.load(Ordering::Acquire)
+            && self.cursor_remote()
             && !self.stop.load(Ordering::Acquire)
             && self.owner_generation.load(Ordering::Acquire) == generation
     }
@@ -910,7 +932,7 @@ impl Shared {
 
     pub(crate) fn owner_cleanup(&self, f: impl FnOnce(bool)) {
         let _guard = self.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
-        f(!self.remote.load(Ordering::Acquire) && self.owner_generation.load(Ordering::Acquire) == 0);
+        f(!self.cursor_remote() && self.owner_generation.load(Ordering::Acquire) == 0);
     }
 
     fn owner_posts_snapshot(&self) -> OwnerPosts {
@@ -949,7 +971,7 @@ impl Shared {
             posts.count -= 1;
             posts.count == 0
         };
-        if last && !self.remote.load(Ordering::Acquire) {
+        if last && !self.cursor_remote() {
             self.pending.fetch_or(PENDING_APPLY_MODE, Ordering::AcqRel);
             wake(self);
         }
@@ -1191,7 +1213,10 @@ fn run(
             let (due, stopped) = crate::capture_loop::poll(Instant::now());
             {
                 let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
-                cursor::source_disabled(!stopped && s.capture_permitted() && crate::capture_loop::mouse_disabled());
+                cursor::source_disabled(
+                    !stopped && s.capture_permitted() && crate::capture_loop::mouse_disabled(),
+                    !stopped && s.capture_permitted() && s.remote.load(Ordering::Acquire),
+                );
             }
             if stopped {
                 break;
@@ -1231,10 +1256,7 @@ fn run(
             {
                 let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
                 // Local restore may be waiting for owner acknowledgements. Do not renew its hide.
-                visibility.check(
-                    transition,
-                    s.remote.load(Ordering::Acquire) && !s.stop.load(Ordering::Acquire),
-                );
+                visibility.check(transition, s.cursor_remote() && !s.stop.load(Ordering::Acquire));
             }
             if transition || last_diagnostics.elapsed() >= Duration::from_secs(1) {
                 last_diagnostics = Instant::now();
@@ -1247,9 +1269,7 @@ fn run(
             }
         }
         let pending = s.pending.swap(0, Ordering::AcqRel);
-        if pending & PENDING_APPLY_MODE != 0
-            || (!s.remote.load(Ordering::Acquire) && s.owner_posts_snapshot().count != 0)
-        {
+        if pending & PENDING_APPLY_MODE != 0 || (!s.cursor_remote() && s.owner_posts_snapshot().count != 0) {
             apply_mode(s);
         }
         if pending & PENDING_OWNER_MOVE != 0 {
@@ -1257,7 +1277,7 @@ fn run(
         }
         // 冻结的光标：有移动事件时（限频）核对，没有事件时（被控的 Mac）也每 0.25 s 核对一次（只记日志）。
         if pacing.is_none()
-            && s.remote.load(Ordering::Acquire)
+            && s.cursor_remote()
             && (pending & PENDING_FREEZE_CHECK != 0 || last_freeze_check.elapsed() >= Duration::from_millis(250))
         {
             last_freeze_check = Instant::now();
@@ -1347,7 +1367,7 @@ fn run(
     CFMachPort::invalidate(&port);
     let _g = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
     *s.hidden.lock().unwrap_or_else(|e| e.into_inner()) = HiddenCursor::Shown;
-    cursor::source_disabled(false);
+    cursor::source_disabled(false, false);
     cursor::restore();
     tracing::debug!("事件 tap 已停止");
 }
@@ -1444,6 +1464,7 @@ fn withdraw_capture(s: &Shared, run_loop: &CFRunLoop, capture: InstalledCapture)
     super::physical_motion::report();
     reset_caps_gesture(s, "capture withdrawn");
     s.remote.store(false, Ordering::Release);
+    s.external_pointer.store(false, Ordering::Release);
     s.keyboard_remote.store(false, Ordering::Release);
     s.restore_pending.store(false, Ordering::Release);
     s.hold_motion.store(false, Ordering::Release);
@@ -1514,6 +1535,7 @@ fn run_owned(
                     && s.capture_permitted()
                     && crate::capture_loop::capture_requested()
                     && crate::capture_loop::mouse_disabled(),
+                !stopped && s.capture_permitted() && s.remote.load(Ordering::Acquire),
             );
         }
         if stopped {
@@ -1559,7 +1581,7 @@ fn run_owned(
     s.caps_guard.leave_remote();
     let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
     *s.hidden.lock().unwrap_or_else(|e| e.into_inner()) = HiddenCursor::Shown;
-    cursor::source_disabled(false);
+    cursor::source_disabled(false, false);
     cursor::restore();
 }
 
@@ -1937,6 +1959,11 @@ unsafe extern "C-unwind" fn callback(
     if let Some(generation) = cursor::owner::event_generation(user_data) {
         s.owner_ack(generation);
         if !s.owner_current(generation) {
+            if s.external_pointer.load(Ordering::Acquire) && is_motion(ty) {
+                // CG posting has already moved the native pointer even though
+                // this stale owner can no longer control its visibility.
+                account_cursor_placement(s, ev, crate::pointer_transition::PlacementKind::Owner, None);
+            }
             tracing::debug!(generation, "cursor owner: discarded stale move");
             return std::ptr::null_mut();
         }
@@ -2033,6 +2060,32 @@ unsafe extern "C-unwind" fn callback(
             native_delta,
         );
         return pass;
+    }
+
+    // Other processes (remote desktop, accessibility tools) target this Mac.
+    // Keep their complete key/button sequences out of the physical routing and
+    // held-input ledgers. Own CG/HID echoes have already been handled above.
+    if !physical {
+        if is_motion(ty) || is_mouse_button(ty) {
+            s.motion.invalidate_position();
+            let at = CGEvent::location(Some(ev));
+            s.warp_fix
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .posted_absolute_motion(Point::new(at.x, at.y), CGEvent::timestamp(Some(ev)));
+        }
+        if (is_motion(ty) || is_mouse_button(ty) || ty == CGEventType::ScrollWheel)
+            && s.remote.load(Ordering::Acquire)
+            && !s.external_pointer.swap(true, Ordering::AcqRel)
+        {
+            s.pending.fetch_or(PENDING_APPLY_MODE, Ordering::AcqRel);
+            wake(s);
+        }
+        return pass;
+    }
+    if physical_pointer_activity(ty, ev) && s.external_pointer.swap(false, Ordering::AcqRel) {
+        s.pending.fetch_or(PENDING_APPLY_MODE, Ordering::AcqRel);
+        wake(s);
     }
 
     if is_motion(ty)
@@ -2587,6 +2640,19 @@ fn is_mouse_button(ty: CGEventType) -> bool {
     )
 }
 
+fn physical_pointer_activity(ty: CGEventType, ev: &CGEvent) -> bool {
+    (is_motion(ty)
+        && (CGEvent::double_value_field(Some(ev), CGEventField::MouseEventDeltaX) != 0.
+            || CGEvent::double_value_field(Some(ev), CGEventField::MouseEventDeltaY) != 0.))
+        || matches!(
+            ty,
+            CGEventType::LeftMouseDown
+                | CGEventType::RightMouseDown
+                | CGEventType::OtherMouseDown
+                | CGEventType::ScrollWheel
+        )
+}
+
 /// Native HID movement advances the HID base; CG placement can leave a fold
 /// for the next hardware delta. Keep their accounting distinct. Use the delivered
 /// coordinate without rewriting the event (which can latch typing-obscure).
@@ -3123,7 +3189,13 @@ mod tests {
             CGEvent::set_type(Some(&event), ty);
             CGEvent::set_flags(Some(&event), flags);
             CGEvent::set_integer_value_field(Some(&event), CGEventField::KeyboardEventKeycode, 0x3b);
-            CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUnixProcessID, 1234);
+            // Untagged modifier transitions represent the physical source;
+            // the source-release and cursor-owner echoes are Oink injections.
+            CGEvent::set_integer_value_field(
+                Some(&event),
+                CGEventField::EventSourceUnixProcessID,
+                if tag == 0 { 0 } else { 1234 },
+            );
             CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUserData, tag);
             // SAFETY: unposted event and isolated state stay alive through the
             // production callback. No native input or event tap is installed.
@@ -3283,6 +3355,7 @@ mod tests {
             motion_generation: motion.new_generation(),
             motion,
             remote: AtomicBool::new(true),
+            external_pointer: AtomicBool::new(false),
             keyboard_remote: AtomicBool::new(false),
             hidden: Mutex::new(HiddenCursor::frozen(at)),
             passed_while_frozen: AtomicU64::new(0),
@@ -3548,6 +3621,183 @@ mod tests {
             assert_eq!(result, pointer.as_ptr());
         }
         assert_eq!(calls.load(Ordering::Relaxed), 0, "own password events entered routing");
+        assert!(!shared.external_pointer.load(Ordering::Acquire));
+    }
+
+    fn unposted_event(ty: CGEventType, physical: bool, at: Point, timestamp: u64) -> CFRetained<CGEvent> {
+        let event = CGEvent::new(None).unwrap();
+        CGEvent::set_type(Some(&event), ty);
+        CGEvent::set_location(Some(&event), objc2_core_foundation::CGPoint::new(at.x, at.y));
+        CGEvent::set_timestamp(Some(&event), timestamp);
+        CGEvent::set_integer_value_field(
+            Some(&event),
+            CGEventField::EventSourceUnixProcessID,
+            if physical { 0 } else { 123456 },
+        );
+        event
+    }
+
+    fn capture_unposted(shared: &Shared, event: &CGEvent) -> *mut CGEvent {
+        // SAFETY: both borrows outlive the synchronous callback. No native tap
+        // or observer is installed and the event is never posted to the desktop.
+        unsafe {
+            callback(
+                std::ptr::null_mut(),
+                CGEvent::r#type(Some(event)),
+                NonNull::from(event),
+                (shared as *const Shared).cast_mut().cast(),
+            )
+        }
+    }
+
+    #[test]
+    fn external_input_stays_local_through_drag_and_key_chords_in_remote_mode() {
+        let shared = fake_shared(Arc::new(|_| panic!("external input entered shared routing")));
+        shared.keyboard_remote.store(true, Ordering::Release);
+        shared.hold_motion.store(true, Ordering::Release);
+        shared.restore_pending.store(true, Ordering::Release);
+        shared.owner_generation.store(42, Ordering::Release);
+        shared.physical_buttons.record(1, true);
+        PRESSED.with(|keys| keys.borrow_mut().insert(KeyCode::LEFT_SHIFT));
+        BUTTONS.with(|buttons| buttons.borrow_mut().insert(MouseButton::Right));
+        KEY_DISPOSITION.with(|keys| keys.borrow_mut().insert(0x38, Disposition::Swallow));
+        let at = Point::new(650., 420.);
+        let flags = CGEventFlags(CGEventFlags::MaskShift.0 | CGEventFlags::MaskCommand.0);
+        for (i, ty) in [
+            CGEventType::LeftMouseDown,
+            CGEventType::LeftMouseDragged,
+            CGEventType::LeftMouseUp,
+            CGEventType::ScrollWheel,
+            CGEventType::FlagsChanged,
+            CGEventType::KeyDown,
+            CGEventType::KeyUp,
+            CGEventType::FlagsChanged,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = unposted_event(ty, false, at, i as u64 + 1);
+            CGEvent::set_flags(Some(&event), flags);
+            CGEvent::set_integer_value_field(Some(&event), CGEventField::KeyboardEventKeycode, 0x38);
+            assert_eq!(capture_unposted(&shared, &event), NonNull::from(&*event).as_ptr());
+            assert_eq!(
+                CGEvent::location(Some(&event)),
+                objc2_core_foundation::CGPoint::new(at.x, at.y)
+            );
+            assert_eq!(CGEvent::flags(Some(&event)), flags);
+            assert!(shared.remote.load(Ordering::Acquire));
+            assert!(shared.keyboard_remote.load(Ordering::Acquire));
+            assert!(!shared.physical_buttons.is_down(0));
+            assert!(shared.physical_buttons.is_down(1));
+            assert!(PRESSED.with(|keys| keys.borrow().contains(&KeyCode::LEFT_SHIFT)));
+            assert_eq!(BUTTONS.with(|buttons| buttons.borrow().len()), 1);
+            assert_eq!(
+                KEY_DISPOSITION.with(|keys| keys.borrow().get(&0x38).copied()),
+                Some(Disposition::Swallow)
+            );
+        }
+        assert!(shared.external_pointer.load(Ordering::Acquire));
+        assert!(
+            !shared.owner_current(42),
+            "a delayed blank-cursor owner must not regain control"
+        );
+        assert_ne!(shared.pending.load(Ordering::Acquire) & PENDING_APPLY_MODE, 0);
+        assert!(matches!(*shared.hidden.lock().unwrap(), HiddenCursor::Frozen { .. }));
+        PRESSED.with(|keys| keys.borrow_mut().clear());
+        BUTTONS.with(|buttons| buttons.borrow_mut().clear());
+        KEY_DISPOSITION.with(|keys| keys.borrow_mut().clear());
+    }
+
+    #[test]
+    fn physical_motion_resumes_remote_routing_without_external_displacement() {
+        let routed = Arc::new(Mutex::new(Vec::new()));
+        let seen = routed.clone();
+        let shared = fake_shared(Arc::new(move |event| {
+            seen.lock().unwrap().push(event.event.clone());
+            Disposition::Swallow
+        }));
+        shared
+            .warp_fix
+            .lock()
+            .unwrap()
+            .native_absolute_motion(Point::new(12., 34.), 1);
+        let external = unposted_event(CGEventType::MouseMoved, false, Point::new(400., 300.), 2);
+        assert_eq!(capture_unposted(&shared, &external), NonNull::from(&*external).as_ptr());
+        assert!(routed.lock().unwrap().is_empty());
+        assert!(!shared.cursor_remote());
+
+        let physical = unposted_event(CGEventType::MouseMoved, true, Point::new(403., 302.), 3);
+        CGEvent::set_integer_value_field(
+            Some(&physical),
+            CGEventField::EventSourceStateID,
+            CGEventSourceStateID::HIDSystemState.0 as i64,
+        );
+        CGEvent::set_double_value_field(Some(&physical), CGEventField::MouseEventDeltaX, 391.);
+        CGEvent::set_double_value_field(Some(&physical), CGEventField::MouseEventDeltaY, 268.);
+        assert!(capture_unposted(&shared, &physical).is_null());
+        assert!(shared.cursor_remote());
+        assert!(
+            routed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| { matches!(event, InputEvent::PointerDelta { dx, dy } if (*dx, *dy) == (3., 2.)) })
+        );
+    }
+
+    #[test]
+    fn external_key_release_stays_local_after_physical_pointer_resumes() {
+        let shared = fake_shared(Arc::new(|_| panic!("external key entered shared routing")));
+        let down = unposted_event(CGEventType::KeyDown, false, Point::default(), 1);
+        assert_eq!(capture_unposted(&shared, &down), NonNull::from(&*down).as_ptr());
+        shared.external_pointer.store(false, Ordering::Release);
+        for remote in [false, true] {
+            shared.remote.store(remote, Ordering::Release);
+            let up = unposted_event(CGEventType::KeyUp, false, Point::default(), 2);
+            assert_eq!(capture_unposted(&shared, &up), NonNull::from(&*up).as_ptr());
+        }
+        assert!(PRESSED.with(|keys| keys.borrow().is_empty()));
+        assert!(KEY_DISPOSITION.with(|keys| keys.borrow().is_empty()));
+    }
+
+    #[test]
+    fn stationary_motion_and_button_release_do_not_rehide_external_pointer() {
+        let event = unposted_event(CGEventType::MouseMoved, true, Point::default(), 1);
+        CGEvent::set_double_value_field(Some(&event), CGEventField::MouseEventDeltaX, 0.);
+        CGEvent::set_double_value_field(Some(&event), CGEventField::MouseEventDeltaY, 0.);
+        assert!(!physical_pointer_activity(CGEventType::MouseMoved, &event));
+        assert!(!physical_pointer_activity(CGEventType::LeftMouseUp, &event));
+        assert!(physical_pointer_activity(CGEventType::LeftMouseDown, &event));
+        CGEvent::set_double_value_field(Some(&event), CGEventField::MouseEventDeltaX, 1.);
+        assert!(physical_pointer_activity(CGEventType::MouseMoved, &event));
+    }
+
+    #[test]
+    fn external_reveal_waits_for_owner_receipts_without_blocking_physical_routing() {
+        let shared = Box::leak(Box::new(fake_shared(Arc::new(|_| Disposition::Swallow))));
+        shared.external_pointer.store(true, Ordering::Release);
+        shared.owner_generation.store(42, Ordering::Release);
+        *shared.owner_posts.lock().unwrap() = OwnerPosts {
+            generation: 42,
+            count: 1,
+            started_ns: now_event_ns(),
+        };
+        let mut hidden = HiddenCursor::frozen(Point::new(12., 34.));
+        apply_mode_locked(shared, &mut hidden);
+        assert!(matches!(hidden, HiddenCursor::Frozen { .. }));
+        assert!(!shared.hold_motion.load(Ordering::Acquire));
+
+        let receipt = unposted_event(CGEventType::MouseMoved, false, Point::new(40., 50.), 2);
+        CGEvent::set_integer_value_field(
+            Some(&receipt),
+            CGEventField::EventSourceUserData,
+            cursor::owner::event_tag(42),
+        );
+        assert!(capture_unposted(shared, &receipt).is_null());
+        assert_eq!(shared.owner_posts_snapshot().count, 0);
+        assert_ne!(shared.pending.load(Ordering::Acquire) & PENDING_APPLY_MODE, 0);
+        assert!(shared.remote.load(Ordering::Acquire));
+        assert!(shared.external_pointer.load(Ordering::Acquire));
     }
 
     #[test]
@@ -3689,7 +3939,7 @@ mod tests {
     }
 
     #[test]
-    fn tap_classification_forwards_foreign_posts_regardless_of_source_state() {
+    fn own_markers_are_independent_of_pid_and_source_state() {
         for source in [-1, 0, 1] {
             for pid in [0, i64::from(std::process::id()), i64::from(std::process::id()) + 1] {
                 for tag in [0, 0x1234, MAGIC, cursor::owner::event_tag(123)] {
@@ -4166,6 +4416,7 @@ mod owned_contact_capture_tests {
             handler: Arc::new(|_| Disposition::Pass),
             gestures: Mutex::new(super::super::gesture_diagnostics::Tracker::default()),
             remote: AtomicBool::new(false),
+            external_pointer: AtomicBool::new(false),
             keyboard_remote: AtomicBool::new(false),
             hidden: Mutex::new(HiddenCursor::Shown),
             owner_generation: AtomicU64::new(0),

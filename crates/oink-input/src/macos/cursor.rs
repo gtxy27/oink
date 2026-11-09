@@ -42,9 +42,9 @@ static DISSOCIATED: AtomicBool = AtomicBool::new(false);
 static SOURCE_DISABLED: AtomicBool = AtomicBool::new(false);
 /// Capture-thread reconciliation, outside event callbacks. Disable physical
 /// motion without changing visibility/position or blocking tagged remote input.
-pub(crate) fn source_disabled(disabled: bool) {
+pub(crate) fn source_disabled(disabled: bool, remote: bool) {
     SOURCE_DISABLED.store(disabled, Ordering::Release);
-    let dissociate = disabled || HIDDEN.load(Ordering::Acquire);
+    let dissociate = disabled || remote || HIDDEN.load(Ordering::Acquire);
     if DISSOCIATED.load(Ordering::Acquire) != dissociate {
         install_exit_hooks();
         let result = CGAssociateMouseAndMouseCursorPosition(!dissociate);
@@ -348,11 +348,21 @@ fn warp(
 
 /// 恢复光标：重新关联、显示。可重复调用。
 pub(crate) fn restore() {
+    restore_with_source_frozen(false);
+}
+
+/// External pointer events remain local while physical motion still belongs to
+/// another screen. Reveal at the injected position without warping or associating.
+pub(crate) fn restore_external() {
+    restore_with_source_frozen(true);
+}
+
+fn restore_with_source_frozen(frozen: bool) {
     tracing::debug!(target: "oink_cursor_timing", "cursor latency: owner release begin");
     owner::release();
     tracing::debug!(target: "oink_cursor_timing", "cursor latency: owner release end");
     handoff_timing::native(TimingStage::ShowStarted, 0);
-    let (associate, show, flush) = restore_native_guarded(SOURCE_DISABLED.load(Ordering::Acquire));
+    let (associate, show, flush) = restore_native_guarded(frozen || SOURCE_DISABLED.load(Ordering::Acquire));
     handoff_timing::native(
         TimingStage::ShowCompleted,
         (associate.unwrap_or(0) | show.unwrap_or(0) | flush.unwrap_or(0)) as u32 | (u32::from(show.is_none()) << 31),

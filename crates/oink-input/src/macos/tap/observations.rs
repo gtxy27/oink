@@ -60,7 +60,8 @@ impl State {
                 while !s.stop.load(Ordering::Acquire) {
                     let pending = s.pending.fetch_and(PENDING_RECONCILE, Ordering::AcqRel);
                     let remote = s.remote.load(Ordering::Acquire);
-                    if pending & PENDING_APPLY_MODE != 0 || (!remote && s.owner_posts_snapshot().count != 0) {
+                    if pending & PENDING_APPLY_MODE != 0 || (!s.cursor_remote() && s.owner_posts_snapshot().count != 0)
+                    {
                         apply_mode(s);
                     }
                     if pending & PENDING_OWNER_MOVE != 0 {
@@ -112,9 +113,9 @@ impl State {
                         session = current;
                         {
                             let _guard = s.cursor_lock.lock().unwrap_or_else(|e| e.into_inner());
-                            visibility.check(transition, remote);
+                            visibility.check(transition, s.cursor_remote());
                         }
-                        if remote {
+                        if s.cursor_remote() {
                             check_frozen(s, &mut freeze);
                         }
                     }
